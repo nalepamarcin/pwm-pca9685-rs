@@ -4,96 +4,102 @@ impl<I2C, E> Pca9685<I2C>
 where
     I2C: hal::blocking::i2c::Write<Error = E> + hal::blocking::i2c::WriteRead<Error = E>,
 {
+    /// Set double register to specific value not touching `full ON/OFF` flag.
+    fn set_double_register_without_flag(&mut self, register: u8, value: u16) -> Result<(), Error<E>> {
+        if value > 4095 {
+            return Err(Error::InvalidInputData);
+        }
+        let reg_h = self.read_register(register + 1)?;
+        let value = ((reg_h & 0x10) as u16) << 8 | value;
+        self.write_double_register(register, value)
+    }
+
     /// Set the `ON` counter for the selected channel.
+    ///
+    /// This method does not touch `full ON` flag.
     ///
     /// Note that the full off setting takes precedence over the `on` settings.
     /// See section 7.3.3 "LED output and PWM control" of the datasheet for
     /// further details.
     pub fn set_channel_on(&mut self, channel: Channel, value: u16) -> Result<(), Error<E>> {
-        if value > 4095 {
-            return Err(Error::InvalidInputData);
-        }
         let reg = get_register_on(channel);
-        self.write_double_register(reg, value)
+        self.set_double_register_without_flag(reg, value)
     }
 
     /// Set the `OFF` counter for the selected channel.
+    ///
+    /// This method does not touch `full OFF` flag.
     pub fn set_channel_off(&mut self, channel: Channel, value: u16) -> Result<(), Error<E>> {
-        if value > 4095 {
-            return Err(Error::InvalidInputData);
-        }
         let reg = get_register_off(channel);
-        self.write_double_register(reg, value)
+        self.set_double_register_without_flag(reg, value)
     }
 
-    /// Set the `ON` and `OFF` counters for the selected channel.
-    ///
-    /// Note that the full off setting takes precedence over the `on` settings.
-    /// See section 7.3.3 "LED output and PWM control" of the datasheet for
-    /// further details.
-    pub fn set_channel_on_off(
-        &mut self,
-        channel: Channel,
-        on: u16,
-        off: u16,
-    ) -> Result<(), Error<E>> {
-        if on > 4095 || off > 4095 {
-            return Err(Error::InvalidInputData);
+    /// Set `full ON/OFF` flag on specific register
+    fn set_register_full_flag(&mut self, register: u8, flag_value: bool) -> Result<(), Error<E>> {
+        let register = register + 1; // flag is in high register
+        let reg_h = self.read_register(register)?;
+        if flag_value && (reg_h & 0x10 == 0) {
+            self.i2c.write(self.address, &[register, reg_h | 0x10]).map_err(Error::I2C)
+        } else if !flag_value && (reg_h & 0x10 != 0) {
+            self.i2c.write(self.address, &[register, reg_h & 0x0f]).map_err(Error::I2C)
+        } else {
+            Ok(())
         }
-        let reg = get_register_on(channel);
-        self.write_two_double_registers(reg, on, off)
     }
 
-    /// Set the channel always on.
+    /// Set the channel always on by setting `full ON` flag.
     ///
-    /// The turning on is delayed by the value argument.
     /// Note that the full off setting takes precedence over the `on` settings.
     ///
     /// See section 7.3.3 "LED output and PWM control" of the datasheet for
     /// further details.
-    pub fn set_channel_full_on(&mut self, channel: Channel, value: u16) -> Result<(), Error<E>> {
-        if value > 4095 {
-            return Err(Error::InvalidInputData);
-        }
+    pub fn set_channel_full_on(&mut self, channel: Channel, flag_value: bool) -> Result<(), Error<E>> {
         let reg = get_register_on(channel);
-        let value = value | 0b0001_0000_0000_0000;
-        self.write_double_register(reg, value)
+        self.set_register_full_flag(reg, flag_value)
     }
 
-    /// Set the channel always off.
+    /// Set the channel always off by setting `full OFF` flag.
     ///
-    /// This takes precedence over the `on` settings and can be cleared by setting
-    /// the `off` counter with [`set_channel_off`](struct.Pca9685.html#method.set_channel_off).
+    /// This takes precedence over the `on` settings.
     ///
     /// See section 7.3.3 "LED output and PWM control" of the datasheet for
     /// further details.
-    pub fn set_channel_full_off(&mut self, channel: Channel) -> Result<(), Error<E>> {
+    pub fn set_channel_full_off(&mut self, channel: Channel, flag_value: bool) -> Result<(), Error<E>> {
         let reg = get_register_off(channel);
-        let value = 0b0001_0000_0000_0000;
-        self.write_double_register(reg, value)
+        self.set_register_full_flag(reg, flag_value)
     }
 
-    /// Set the `ON` and `OFF` counter for each channel at once.
+    /// Get the effective pulse length from `OFF` and `ON` counters.
     ///
-    /// The index of the value in the arrays corresponds to the channel: 0-15.
-    /// Note that the full off setting takes precedence over the `on` settings.
-    /// See section 7.3.3 "LED output and PWM control" of the datasheet for
-    /// further details.
-    pub fn set_all_on_off(&mut self, on: &[u16; 16], off: &[u16; 16]) -> Result<(), Error<E>> {
-        let mut data = [0; 65];
-        data[0] = Register::C0_ON_L;
-        for (i, (on, off)) in on.iter().zip(off).enumerate() {
-            if *on > 4095 || *off > 4095 {
-                return Err(Error::InvalidInputData);
-            }
-            data[i * 4 + 1] = *on as u8;
-            data[i * 4 + 2] = (*on >> 8) as u8;
-            data[i * 4 + 3] = *off as u8;
-            data[i * 4 + 4] = (*off >> 8) as u8;
-        }
+    /// This takes into account `full ON/OFF` flags.
+    pub fn get_effective_pulse(&mut self, channel: Channel) -> Result<u16, Error<E>> {
+        let reg = get_register_on(channel);
         self.enable_auto_increment()?;
-        self.i2c.write(self.address, &data).map_err(Error::I2C)
+
+        let mut data = [0, 0, 0, 0];
+        self.i2c.write_read(self.address, &[reg], &mut data).map_err(Error::I2C)?;
+
+        // full off - highest priority
+        if (data[3] & 0x10) != 0 {
+            return Ok(0);
+        }
+
+        // full on
+        if (data[1] & 0x10) != 0 {
+            return Ok(4095);
+        }
+
+        // else normal mode
+        let on_t = ((data[1] as u16) << 8) | data[0] as u16;
+        let off_t = ((data[3] as u16) << 8) | data[2] as u16;
+
+        if off_t >= on_t {
+            Ok(off_t - on_t)
+        } else {
+            Ok(4095 - on_t + off_t)
+        }
     }
+
 }
 
 macro_rules! get_register {

@@ -78,6 +78,7 @@ where
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn write_two_double_registers(
         &mut self,
         address: u8,
