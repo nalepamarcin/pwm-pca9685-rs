@@ -4,6 +4,12 @@ impl<I2C, E> Pca9685<I2C>
 where
     I2C: hal::blocking::i2c::Write<Error = E> + hal::blocking::i2c::WriteRead<Error = E>,
 {
+    // Get double register without `full ON/OFF` flag;
+    fn get_double_register_without_flag(&mut self, register: u8) -> Result<u16, Error<E>> {
+        let value = self.read_double_register(register)?;
+        Ok(value & 0x0fff)
+    }
+
     /// Set double register to specific value not touching `full ON/OFF` flag.
     fn set_double_register_without_flag(&mut self, register: u8, value: u16) -> Result<(), Error<E>> {
         if value > 4095 {
@@ -12,6 +18,13 @@ where
         let reg_h = self.read_register(register + 1)?;
         let value = ((reg_h & 0x10) as u16) << 8 | value;
         self.write_double_register(register, value)
+    }
+
+    /// Get the `ON` counter for the selected channel.
+    ///
+    /// This method masks `full ON` flag.
+    pub fn get_channel_on(&mut self, channel: Channel) -> Result<u16, Error<E>> {
+        self.get_double_register_without_flag(get_register_on(channel))
     }
 
     /// Set the `ON` counter for the selected channel.
@@ -24,6 +37,13 @@ where
     pub fn set_channel_on(&mut self, channel: Channel, value: u16) -> Result<(), Error<E>> {
         let reg = get_register_on(channel);
         self.set_double_register_without_flag(reg, value)
+    }
+
+    /// Get the `OFF` counter for the select channel.
+    ///
+    /// This method masks `full OFF` flag.
+    pub fn get_channel_off(&mut self, channel: Channel) -> Result<u16, Error<E>> {
+        self.get_double_register_without_flag(get_register_off(channel))
     }
 
     /// Set the `OFF` counter for the selected channel.
@@ -69,34 +89,94 @@ where
         self.set_register_full_flag(reg, flag_value)
     }
 
+    /// Set channel `ON` and `OFF` counters
+    ///
+    /// This method overrides `full ON/OFF` flags.
+    pub fn set_channel_on_off(&mut self, channel: Channel, on_value: u16, off_value: u16) -> Result<(), Error<E>> {
+        if on_value > 4095 || off_value > 4095 {
+            return Err(Error::InvalidInputData);
+        }
+        self.write_two_double_registers(get_register_on(channel), on_value, off_value)
+    }
+
+    /// Check if double register has `full ON/OFF` flag set.
+    pub fn is_full_flag_set(value: u16) -> bool {
+        value & 0x1000 != 0
+    }
+
+    /// Get raw values of `ON/OFF` counters.
+    pub fn get_channel_on_off_with_flags(&mut self, channel: Channel) -> Result<(u16, u16), Error<E>> {
+        self.read_two_double_registers(get_register_on(channel))
+    }
+
+    /// Get raw values of `ON/OFF` counters for all channels.
+    ///
+    /// Known issue:
+    /// &\[u8\] cannot be safely (without unsafe) and reliably (alignment issues) treated as &\[u16\].
+    /// Compiler support is needed to ensure proper alignment.
+    pub fn get_all_channels_on_off_with_flags(&mut self) -> Result<[u16; 32], Error<E>> {
+        // TODO: transmute instead making sure alignment is OK
+        // so for now new array is created
+        let mut data: [u8; 64] = [0; 64];
+        let mut ret: [u16; 32] = [0; 32];
+
+        self.enable_auto_increment()?;
+
+        self.i2c
+            .write_read(self.address, &[get_register_on(Channel::C0)], &mut data)
+            .map_err(Error::I2C)?;
+
+        for (i, s) in data.chunks(4).enumerate() {
+            ret[2 * i] =     ((s[1] as u16) << 8) | s[0] as u16;
+            ret[2 * i + 1] = ((s[3] as u16) << 8) | s[2] as u16;
+        }
+        Ok(ret)
+    }
+
+    /// Set raw values of `ON/OFF` counters for all channels.
+    ///
+    /// Known issue:
+    /// &\[u16\] should be converted directly into &\[u8\] without copying
+    pub fn set_all_channels_on_off_with_flags(&mut self, channels_data: &[u16]) -> Result<(), Error<E>> {
+        if channels_data.len() != 32 {
+            return Err(Error::InvalidInputData);
+        }
+
+        let mut data: [u8; 65] = [0; 65];
+        data[0] = get_register_on(Channel::C0);
+        for (i, s) in channels_data.iter().enumerate() {
+            data[1 + 2*i] = *s as u8;
+            data[1 + 2*i + 1] = (*s >> 8) as u8;
+        }
+
+        self.enable_auto_increment()?;
+        self.i2c
+            .write(self.address, &data)
+            .map_err(Error::I2C)
+    }
+
+    /// Get pulse length from `ON` and `OFF` counters.
+    ///
+    /// `full ON/OFF` flags *must* be false.
+    pub fn get_pulse_length(on_t: u16, off_t: u16) -> u16 {
+        if off_t >= on_t {
+            off_t - on_t
+        } else {
+            4095 - on_t + off_t
+        }
+    }
+
     /// Get the effective pulse length from `OFF` and `ON` counters.
     ///
     /// This takes into account `full ON/OFF` flags.
     pub fn get_effective_pulse(&mut self, channel: Channel) -> Result<u16, Error<E>> {
-        let reg = get_register_on(channel);
-        self.enable_auto_increment()?;
-
-        let mut data = [0, 0, 0, 0];
-        self.i2c.write_read(self.address, &[reg], &mut data).map_err(Error::I2C)?;
-
-        // full off - highest priority
-        if (data[3] & 0x10) != 0 {
-            return Ok(0);
-        }
-
-        // full on
-        if (data[1] & 0x10) != 0 {
-            return Ok(4095);
-        }
-
-        // else normal mode
-        let on_t = ((data[1] as u16) << 8) | data[0] as u16;
-        let off_t = ((data[3] as u16) << 8) | data[2] as u16;
-
-        if off_t >= on_t {
-            Ok(off_t - on_t)
+        let (on_t, off_t) = self.read_two_double_registers(get_register_on(channel))?;
+        if Self::is_full_flag_set(off_t) {
+            Ok(0)
+        } else if Self::is_full_flag_set(on_t) {
+            Ok(4095)
         } else {
-            Ok(4095 - on_t + off_t)
+            Ok(Self::get_pulse_length(on_t, off_t))
         }
     }
 

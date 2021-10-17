@@ -78,7 +78,6 @@ where
         }
     }
 
-    #[allow(dead_code)]
     pub(crate) fn write_two_double_registers(
         &mut self,
         address: u8,
@@ -117,5 +116,34 @@ where
             .write_read(self.address, &[address], &mut data)
             .map_err(Error::I2C)
             .and(Ok(data[0]))
+    }
+
+    pub(crate) fn read_double_register(
+        &mut self,
+        address: u8
+    ) -> Result<u16, Error<E>> {
+        self.enable_auto_increment()?;
+        let mut data = [0, 0];
+        self.i2c
+            .write_read(self.address, &[address], &mut data)
+            .map_err(Error::I2C)
+            .and(Ok(
+                ((data[1] as u16) << 8) | (data[0] as u16)
+            ))
+    }
+
+    pub(crate) fn read_two_double_registers(
+        &mut self,
+        address: u8
+    ) -> Result<(u16, u16), Error<E>> {
+        self.enable_auto_increment()?;
+        let mut data = [0, 0, 0, 0];
+        self.i2c
+            .write_read(self.address, &[address], &mut data)
+            .map_err(Error::I2C)
+            .and(Ok((
+                ((data[1] as u16) << 8) | (data[0] as u16),
+                ((data[3] as u16) << 8) | (data[2] as u16)
+            )))
     }
 }
