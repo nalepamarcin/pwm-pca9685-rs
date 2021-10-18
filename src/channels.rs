@@ -110,26 +110,24 @@ where
     }
 
     /// Get raw values of `ON/OFF` counters for all channels.
-    ///
-    /// Known issue:
-    /// &\[u8\] cannot be safely (without unsafe) and reliably (alignment issues) treated as &\[u16\].
-    /// Compiler support is needed to ensure proper alignment.
+    #[allow(unsafe_code)]
     pub fn get_all_channels_on_off_with_flags(&mut self) -> Result<[u16; 32], Error<E>> {
-        // TODO: transmute instead making sure alignment is OK
-        // so for now new array is created
-        let mut data: [u8; 64] = [0; 64];
         let mut ret: [u16; 32] = [0; 32];
+        let mut u8_slice = unsafe {
+            let (prefix, data, suffix) = ret.align_to_mut::<u8>();
+            if !prefix.is_empty() || !suffix.is_empty() {
+                panic!("Casting &[u16] to &[u8] returned unaligned data");
+            }
+            data
+        };
 
         self.enable_auto_increment()?;
 
         self.i2c
-            .write_read(self.address, &[get_register_on(Channel::C0)], &mut data)
+            .write_read(self.address, &[get_register_on(Channel::C0)], &mut u8_slice)
             .map_err(Error::I2C)?;
 
-        for (i, s) in data.chunks(4).enumerate() {
-            ret[2 * i] =     ((s[1] as u16) << 8) | s[0] as u16;
-            ret[2 * i + 1] = ((s[3] as u16) << 8) | s[2] as u16;
-        }
+        ret.iter_mut().for_each(|v| *v = u16::from_le(*v));
         Ok(ret)
     }
 
